@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Annotation output (generated data)
+output/
+
+# macOS
+.DS_Store
