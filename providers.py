@@ -9,6 +9,7 @@ Add a new backend by subclassing `Provider` and registering it in `PROVIDERS`.
 
 import base64
 import io
+import re
 
 import httpx
 from openai import OpenAI
@@ -19,6 +20,22 @@ def _png_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
+
+
+THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def strip_thinking(text: str) -> str:
+    """Drop the reasoning block that thinking models (e.g. Qwen3-VL *-Thinking)
+    put before their answer."""
+    text = THINK_RE.sub("", text)
+    # Some chat templates open <think> in the prompt, so only the closing tag comes back.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[1]
+    # Still thinking when max_tokens ran out: there is no answer yet.
+    elif text.lstrip().startswith("<think>"):
+        return ""
+    return text.strip()
 
 
 class Provider:
@@ -64,7 +81,7 @@ class OpenAICompatProvider(Provider):
                 ],
             }],
         )
-        return (resp.choices[0].message.content or "").strip()
+        return strip_thinking(resp.choices[0].message.content or "")
 
 
 class LMStudioProvider(OpenAICompatProvider):
@@ -106,7 +123,7 @@ class OllamaProvider(Provider):
         )
         if r.status_code >= 400:
             raise RuntimeError(f"Ollama {r.status_code}: {r.text.strip()}")
-        return (r.json().get("message", {}).get("content") or "").strip()
+        return strip_thinking(r.json().get("message", {}).get("content") or "")
 
 
 PROVIDERS: dict[str, type[Provider]] = {

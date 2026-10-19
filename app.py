@@ -1,17 +1,22 @@
-"""Text-annotation tool backed by PaddleOCR-VL-1.5 (or another vision model)
-served by LM Studio, Ollama or any OpenAI-compatible server — see providers.py.
+"""Document-annotation tool backed by PaddleOCR-VL-1.5 or Qwen3-VL (or another
+vision model) served by LM Studio, Ollama or any OpenAI-compatible server — see
+providers.py. Two tabs share the image list and model settings:
 
+Text boxes
 - "Auto-detect" runs the model's `Spotting:` task on the whole image and turns
   every returned text line into a labelled rectangle.
 - Draw / move / resize boxes by hand, then "OCR boxes" crops each box and runs
   the `OCR:` task to fill in its label.
 - Annotations are autosaved per image and can be exported in PPOCRLabel format
   (Label.txt for detection, crops + rec_gt.txt for recognition).
+
+Structured document (structure.py)
+- Detect the page's sections, read each one, and save the page as structured
+  JSON (exported as structured.jsonl).
 """
 
 import argparse
 import json
-import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -19,47 +24,24 @@ from pathlib import Path
 import gradio as gr
 import pandas as pd
 from gradio_image_annotation import image_annotator
-from PIL import Image, ImageOps
 
+import structure
+from common import (ask_model, crop_box, make_cfg, open_image, parse_loc_lines,
+                    status_text)
 from providers import PROVIDERS, get_provider
+from structure import PROFILES, pick_model, profile_for
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 BOX_COLOR = (255, 64, 64)
 TABLE_HEADERS = ["#", "label", "xmin", "ymin", "xmax", "ymax"]
-LOC_RE = re.compile(r"<\|LOC_(\d+)\|>")
 
 
 # --------------------------------------------------------------------------- #
-# Model calls
+# Model output
 # --------------------------------------------------------------------------- #
-def ask_model(img: Image.Image, prompt: str, cfg: dict) -> str:
-    if not cfg["model"]:
-        raise gr.Error("Pick a model in Settings first.")
-    provider = get_provider(cfg["provider"], cfg["base_url"], cfg["api_key"])
-    try:
-        return provider.chat(img, prompt, cfg["model"], cfg["max_tokens"])
-    except gr.Error:
-        raise
-    except Exception as e:
-        raise gr.Error(f"{cfg['provider']} request failed: {e}")
-
-
 def parse_spotting(text: str, width: int, height: int) -> list[dict]:
-    """Parse `text<|LOC_x1|><|LOC_y1|>...<|LOC_x4|><|LOC_y4|>` lines.
-
-    Coordinates are normalised to 0..1000; the quad is reduced to its
-    axis-aligned bounding rectangle.
-    """
-    boxes = []
-    for line in text.splitlines():
-        locs = [int(v) for v in LOC_RE.findall(line)]
-        label = LOC_RE.sub("", line).strip()
-        if len(locs) < 4 or not label:
-            continue
-        xs = [locs[i] * width / 1000 for i in range(0, len(locs) - 1, 2)]
-        ys = [locs[i] * height / 1000 for i in range(1, len(locs), 2)]
-        boxes.append(make_box(label, min(xs), min(ys), max(xs), max(ys), width, height))
-    return boxes
+    return [make_box(label, *rect, width, height)
+            for label, *rect in parse_loc_lines(text, width, height)]
 
 
 def make_box(label, xmin, ymin, xmax, ymax, width, height) -> dict:
@@ -70,19 +52,6 @@ def make_box(label, xmin, ymin, xmax, ymax, width, height) -> dict:
         "xmax": clamp(xmax, width), "ymax": clamp(ymax, height),
         "color": BOX_COLOR,
     }
-
-
-def crop_box(img: Image.Image, box: dict, pad: int) -> Image.Image:
-    w, h = img.size
-    crop = img.crop((
-        max(0, box["xmin"] - pad), max(0, box["ymin"] - pad),
-        min(w, box["xmax"] + pad), min(h, box["ymax"] + pad),
-    ))
-    # The model does poorly on tiny crops; upscale short lines a bit.
-    if crop.height < 48:
-        scale = 48 / max(crop.height, 1)
-        crop = crop.resize((max(1, int(crop.width * scale)), 48), Image.BICUBIC)
-    return crop
 
 
 # --------------------------------------------------------------------------- #
@@ -108,10 +77,6 @@ def save_boxes(out_dir: str, image_path: str, boxes: list[dict]) -> None:
                             ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def open_image(path: str) -> Image.Image:
-    return ImageOps.exif_transpose(Image.open(path)).convert("RGB")
-
-
 # --------------------------------------------------------------------------- #
 # UI helpers
 # --------------------------------------------------------------------------- #
@@ -135,17 +100,11 @@ def current_boxes(annot) -> list[dict]:
     return [{**b, "color": BOX_COLOR} for b in annot.get("boxes", [])]
 
 
-def status_text(paths, idx, extra=""):
-    if not paths:
-        return "No images loaded."
-    msg = f"Image {idx + 1}/{len(paths)} — `{Path(paths[idx]).name}`"
-    return f"{msg}  \n{extra}" if extra else msg
-
-
 def show(paths, idx, out_dir, extra=""):
-    """Return outputs for (annotator, table, status, selector)."""
+    """Return outputs for (annotator, table, status, selector, *structure tab)."""
     if not paths:
-        return None, boxes_to_table([]), status_text(paths, idx), gr.update(choices=[], value=None)
+        return (None, boxes_to_table([]), status_text(paths, idx),
+                gr.update(choices=[], value=None), *structure.show(None, out_dir))
     path = paths[idx]
     boxes = load_boxes(out_dir, path)
     return (
@@ -153,6 +112,7 @@ def show(paths, idx, out_dir, extra=""):
         boxes_to_table(boxes),
         status_text(paths, idx, extra),
         gr.update(choices=[Path(p).name for p in paths], value=Path(path).name),
+        *structure.show(path, out_dir),
     )
 
 
@@ -161,11 +121,12 @@ def show(paths, idx, out_dir, extra=""):
 # --------------------------------------------------------------------------- #
 def build_app(default_provider: str, default_url: str, default_model: str,
               default_out: str) -> gr.Blocks:
+    default_preset = profile_for(default_model) or next(iter(PROFILES))
     with gr.Blocks(title="PaddleOCR-VL Annotator") as demo:
         paths_state = gr.State([])
         idx_state = gr.State(0)
 
-        gr.Markdown("## PaddleOCR-VL Text Annotator")
+        gr.Markdown("## PaddleOCR-VL Document Annotator")
 
         with gr.Row():
             # ---------------- Sidebar ----------------
@@ -182,6 +143,8 @@ def build_app(default_provider: str, default_url: str, default_model: str,
                 status = gr.Markdown("No images loaded.")
 
                 with gr.Accordion("Model", open=True):
+                    preset = gr.Radio(list(PROFILES), value=default_preset,
+                                      label="Model preset")
                     provider = gr.Dropdown(list(PROVIDERS), value=default_provider,
                                            label="Provider")
                     base_url = gr.Textbox(
@@ -197,78 +160,105 @@ def build_app(default_provider: str, default_url: str, default_model: str,
                 with gr.Accordion("Settings", open=False):
                     spot_prompt = gr.Textbox("Spotting:", label="Detect prompt (must return "
                                              "<|LOC_n|> boxes, PaddleOCR-VL format)")
-                    ocr_prompt = gr.Textbox("OCR:", label="OCR prompt (per box)")
-                    max_tokens = gr.Number(4096, label="Max tokens", precision=0)
+                    ocr_prompt = gr.Textbox(PROFILES[default_preset]["read_prompts"]["_default"],
+                                            label="OCR prompt (per box)")
+                    max_tokens = gr.Number(4096, label="Max tokens (text boxes)", precision=0)
                     pad = gr.Number(4, label="Crop padding (px)", precision=0)
                     out_dir = gr.Textbox(default_out, label="Output folder")
 
             # ---------------- Main ----------------
             with gr.Column(scale=4):
-                with gr.Row():
-                    detect_btn = gr.Button("🔍 Auto-detect (Spotting)", variant="primary")
-                    ocr_mode = gr.Radio(["Unlabelled boxes", "All boxes"],
-                                        value="Unlabelled boxes", show_label=False,
-                                        container=False)
-                    ocr_btn = gr.Button("🔤 OCR boxes")
-                    save_btn = gr.Button("💾 Save")
-                    clear_btn = gr.Button("🗑 Clear boxes", variant="stop")
+                with gr.Tabs():
+                    with gr.Tab("Text boxes"):
+                        with gr.Row():
+                            detect_btn = gr.Button("🔍 Auto-detect (Spotting)", variant="primary")
+                            ocr_mode = gr.Radio(["Unlabelled boxes", "All boxes"],
+                                                value="Unlabelled boxes", show_label=False,
+                                                container=False)
+                            ocr_btn = gr.Button("🔤 OCR boxes")
+                            save_btn = gr.Button("💾 Save")
+                            clear_btn = gr.Button("🗑 Clear boxes", variant="stop")
 
-                annot = image_annotator(
-                    label="Draw boxes (drag on image). Double-click a box to edit its label; "
-                          "select + Delete to remove.",
-                    image_type="filepath",
-                    sources=[],
-                    boxes_alpha=0.15,
-                    box_min_size=4,
-                    handle_size=6,
-                    show_clear_button=False,
-                    show_remove_button=False,
-                    height=720,
-                )
+                        annot = image_annotator(
+                            label="Draw boxes (drag on image). Double-click a box to edit its label; "
+                                  "select + Delete to remove.",
+                            image_type="filepath",
+                            sources=[],
+                            boxes_alpha=0.15,
+                            box_min_size=4,
+                            handle_size=6,
+                            show_clear_button=False,
+                            show_remove_button=False,
+                            height=720,
+                        )
 
-                with gr.Row():
-                    table = gr.Dataframe(
-                        headers=TABLE_HEADERS,
-                        datatype=["number", "str", "number", "number", "number", "number"],
-                        interactive=True,
-                        label="Boxes — edit labels/coords here, then click Apply",
-                        wrap=True,
-                        scale=4,
-                    )
-                    with gr.Column(scale=1, min_width=160):
-                        apply_btn = gr.Button("✅ Apply table edits")
-                        export_btn = gr.Button("📦 Export dataset", variant="primary")
-                        export_files = gr.File(label="Export", file_count="multiple")
+                        with gr.Row():
+                            table = gr.Dataframe(
+                                headers=TABLE_HEADERS,
+                                datatype=["number", "str", "number", "number", "number", "number"],
+                                interactive=True,
+                                label="Boxes — edit labels/coords here, then click Apply",
+                                wrap=True,
+                                scale=4,
+                            )
+                            with gr.Column(scale=1, min_width=160):
+                                apply_btn = gr.Button("✅ Apply table edits")
+                                export_btn = gr.Button("📦 Export dataset", variant="primary")
+                                export_files = gr.File(label="Export", file_count="multiple")
+
+                    with gr.Tab("Structured document"):
+                        sv = structure.build_tab(default_preset)
 
         cfg_inputs = [provider, base_url, api_key, model, max_tokens]
 
-        def make_cfg(prov, url, key, mdl, mt):
-            return {"provider": prov, "base_url": url, "api_key": key,
-                    "model": mdl, "max_tokens": mt}
-
         # ---------------- Provider / model selection ----------------
-        def fetch_models(prov, url, key, current):
+        def list_models(prov, url, key):
             try:
                 models = get_provider(prov, url, key).list_models()
             except Exception as e:
                 gr.Warning(f"Could not list models from {prov} at {url}: {e}")
-                return gr.update()
+                return None
             if not models:
                 gr.Warning(f"{prov} returned no models.")
+            return models
+
+        def fetch_models(prov, url, key, current, preset_name):
+            models = list_models(prov, url, key)
+            if models is None:
+                return gr.update()
             # Keep the current choice if the server still has it; otherwise
-            # prefer anything that looks like PaddleOCR.
-            value = current if current in models else next(
-                (m for m in models if "paddle" in m.lower()), models[0] if models else None)
+            # prefer the preset's model.
+            value = current if current in models else (
+                pick_model(models, preset_name) or (models[0] if models else None))
             return gr.update(choices=models, value=value)
 
-        def on_provider_change(prov, key):
-            url = PROVIDERS[prov].default_url
-            return url, fetch_models(prov, url, key, None)
+        def switch_preset(preset_name, prov, url, key):
+            models = list_models(prov, url, key) or []
+            value = pick_model(models, preset_name)
+            if not value:
+                value = PROFILES[preset_name]["model"]
+                gr.Warning(f"{prov} has no {preset_name} model loaded; using {value!r}. "
+                           "Load it on the server, then click 🔄.")
+            return gr.update(choices=sorted({*models, value}), value=value)
 
-        provider.input(on_provider_change, [provider, api_key], [base_url, model])
-        refresh_btn.click(fetch_models, [provider, base_url, api_key, model], model)
-        demo.load(fetch_models, [provider, base_url, api_key, model], model)
-        view_outputs = [annot, table, status, selector]
+        def on_model_change(mdl):
+            # Follow a model picked by hand: switch preset and its prompts.
+            name = profile_for(mdl)
+            if not name:
+                return gr.skip(), gr.skip(), gr.skip()
+            p = PROFILES[name]
+            return name, p["detect_prompt"], p["read_prompts"]["_default"]
+
+        def on_provider_change(prov, key, preset_name):
+            url = PROVIDERS[prov].default_url
+            return url, fetch_models(prov, url, key, None, preset_name)
+
+        provider.input(on_provider_change, [provider, api_key, preset], [base_url, model])
+        refresh_btn.click(fetch_models, [provider, base_url, api_key, model, preset], model)
+        preset.input(switch_preset, [preset, provider, base_url, api_key], model)
+        model.change(on_model_change, model, [preset, sv.detect_prompt, ocr_prompt])
+        demo.load(fetch_models, [provider, base_url, api_key, model, preset], model)
+        view_outputs = [annot, table, status, selector, *sv.outputs]
 
         # ---------------- Loading / navigation ----------------
         def load_folder(folder_path, out):
@@ -297,7 +287,7 @@ def build_app(default_provider: str, default_url: str, default_model: str,
         def jump(name, paths, idx, annot_val, out):
             names = [Path(p).name for p in paths]
             if not name or name not in names or names.index(name) == idx:
-                return gr.skip(), *[gr.skip()] * 4
+                return [gr.skip()] * (1 + len(view_outputs))
             return navigate(names.index(name) - idx, paths, idx, annot_val, out)
 
         load_folder_btn.click(load_folder, [folder, out_dir],
@@ -396,6 +386,10 @@ def build_app(default_provider: str, default_url: str, default_model: str,
         apply_btn.click(apply_table, [table, paths_state, idx_state, out_dir], [annot, table])
         save_btn.click(save_current, [paths_state, idx_state, annot, out_dir], None)
         clear_btn.click(clear_current, [paths_state, idx_state, out_dir], [annot, table])
+
+        structure.wire(sv, paths_state=paths_state, idx_state=idx_state,
+                       conn_inputs=[provider, base_url, api_key, model], preset=preset,
+                       pad=pad, out_dir=out_dir, status=status)
 
         # ---------------- Export ----------------
         def export(paths, idx, annot_val, out, padding):
