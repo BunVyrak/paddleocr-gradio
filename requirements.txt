@@ -3,3 +3,4 @@ gradio_image_annotation>=0.5.6
 openai
 pandas
 pillow
+jsonschema

@@ -13,6 +13,7 @@ Text boxes
 Structured document (structure.py)
 - Detect the page's sections, read each one, and save the page as structured
   JSON (exported as structured.jsonl).
+- Convert it to a Q&A, MCQ or QCM schema (schemas.py).
 """
 
 import argparse
@@ -233,13 +234,18 @@ def build_app(default_provider: str, default_url: str, default_model: str,
             return gr.update(choices=models, value=value)
 
         def switch_preset(preset_name, prov, url, key):
+            p = PROFILES[preset_name]
+            prompts = p["detect_prompt"], p["read_prompts"]["_default"]
+            if not p["match"]:
+                # Generic preset: keep whichever model is selected.
+                return gr.update(), *prompts
             models = list_models(prov, url, key) or []
             value = pick_model(models, preset_name)
             if not value:
-                value = PROFILES[preset_name]["model"]
+                value = p["model"]
                 gr.Warning(f"{prov} has no {preset_name} model loaded; using {value!r}. "
                            "Load it on the server, then click 🔄.")
-            return gr.update(choices=sorted({*models, value}), value=value)
+            return gr.update(choices=sorted({*models, value}), value=value), *prompts
 
         def on_model_change(mdl):
             # Follow a model picked by hand: switch preset and its prompts.
@@ -255,7 +261,8 @@ def build_app(default_provider: str, default_url: str, default_model: str,
 
         provider.input(on_provider_change, [provider, api_key, preset], [base_url, model])
         refresh_btn.click(fetch_models, [provider, base_url, api_key, model, preset], model)
-        preset.input(switch_preset, [preset, provider, base_url, api_key], model)
+        preset.input(switch_preset, [preset, provider, base_url, api_key],
+                     [model, sv.detect_prompt, ocr_prompt])
         model.change(on_model_change, model, [preset, sv.detect_prompt, ocr_prompt])
         demo.load(fetch_models, [provider, base_url, api_key, model, preset], model)
         view_outputs = [annot, table, status, selector, *sv.outputs]
